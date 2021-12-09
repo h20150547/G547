@@ -1,291 +1,364 @@
+/***************************************************************************//**
+*  \file       driver.c
+*
+*  \details    Simple GPIO driver explanation (GPIO Interrupt)
+*
+*  \author     EmbeTronicX
+*
+*  \Tested with Linux raspberrypi 5.4.51-v7l+
+*
+*******************************************************************************/
 #include <linux/kernel.h>
-#include <linux/device.h>
 #include <linux/init.h>
-#include <asm/io.h>
-#include <linux/cdev.h>
-#include <asm/uaccess.h>
-#include <linux/fs.h>
 #include <linux/module.h>
+#include <linux/kdev_t.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/delay.h>
+#include <linux/uaccess.h>  //copy_to/from_user()
+#include <linux/gpio.h>     //GPIO
+#include <linux/interrupt.h>
 
-#define BCM2835_PERI_BASE 0x3f000000   
-#define GPIO_BASE (BCM2835_PERI_BASE + 0x200000)
-#define GPIO_REGION_SIZE 0x3c
-#define GPLEV_OFFSET 0x34
+/* Since debounce is not supported in Raspberry pi, I have addded this to disable 
+** the false detection (multiple IRQ trigger for one interrupt).
+** Many other hardware supports GPIO debounce, I don't want care about this even 
+** if this has any overhead. Our intention is to explain the GPIO interrupt.
+** If you want to disable this extra coding, you can comment the below macro.
+** This has been taken from : https://raspberrypi.stackexchange.com/questions/8544/gpio-interrupt-debounce
+**
+** If you want to use Hardaware Debounce, then comment this EN_DEBOUNCE.
+**
+*/
+#define EN_DEBOUNCE
 
-/* Detect PIR signal at two GPIO Pins */
+#ifdef EN_DEBOUNCE
+#include <linux/jiffies.h>
 
-#define GPIO_PIR1 19  // This is GPIO 19/ Pin 35
-#define GPIO_PIR2 13 // This is GPIO 13/ Pin 33
+extern unsigned long volatile jiffies;
+unsigned long old_jiffie = 0;
+#endif
 
-#define HIGH 1
-#define LOW 0
-#define MODULE_NAME "pir_parking"
-#define NUM_PIR_Sensors 2
-#define BUF_SIZE 2
+//LED is connected to this GPIO
+#define GPIO_21_OUT (21)
 
-char val[2];
+//PIR1 is connected to this GPIO
+#define GPIO_25_IN  (19)
 
-/* Define the required operations on the device file*/
-static ssize_t pir_parking_read(struct file *filep, char __user *buf, size_t len, loff_t *off);
-static ssize_t pir_parking_write(struct file *filep, const char __user *buf, size_t len, loff_t *off);
-static int pir_parking_open(struct inode *inodep, struct file *filep);
-static int pir_parking_release(struct inode *inodep, struct file *filep);
+//PIR1 is connected to this GPIO
+#define GPIO_25_IN  (13)
 
-/* Extra functions*/
-static void save_gpio_func_select(void);
-static void restore_gpio_func_select(void);
-static void pin_direction_input(void);
-static void read_pin(void);
+//GPIO_25_IN value toggle
+unsigned int led_toggle = 0; 
 
-static void save_gpio_func_select2(void);
-static void restore_gpio_func_select2(void);
-static void pin_direction_input2(void);
-static void read_pin2(void);
+/* Storing GPIO IRQ Numbers */
+unsigned int GPIO_irq1; // For GPIO_PIR1
+unsigned int GPIO_irq2; // For GPIO_PIR2
 
-static dev_t devt;
-static struct cdev pir_cdev;
-static struct class *pir_class;
-static struct device *pir_device;
+//Interrupt handler for GPIO_PIR1
+static irqreturn_t gpio_irq1_handler(int irq,void *dev_id) 
+{
+  static unsigned long flags = 0;
+  
+#ifdef EN_DEBOUNCE
+   unsigned long diff = jiffies - old_jiffie;
+   if (diff < 20)
+   {
+     return IRQ_HANDLED;
+   }
+  
+  old_jiffie = jiffies;
+#endif  
 
-/* 
-  the iomap variable is used to point to the first GPIO register. 
- */
-static void __iomem *iomap;
-static int func_select_reg_offset;
-static int func_select_bit_offset;
-static int func_select_reg_offset2;
-static int func_select_bit_offset2;
-static char pin_value[BUF_SIZE] = "";
-static char pin_value2[BUF_SIZE] = "";
-static int func_select_initial_val;
-static int func_select_initial_val2;
+  local_irq_save(flags);
+  // led_toggle = (0x01 ^ led_toggle);                             // toggle the old value
+  // gpio_set_value(GPIO_21_OUT, led_toggle);                      // toggle the GPIO_21_OUT
+  pr_info("Interrupt Occurred : GPIO_PIR1 : %d ",gpio_get_value(GPIO_PIR1));
+  local_irq_restore(flags);
+  return IRQ_HANDLED;
+}
 
-static struct file_operations fops = {
-	.owner = THIS_MODULE,
-	.open = pir_parking_open,
-	.release = pir_parking_release,
-	.read = pir_parking_read,
-	.write = pir_parking_write,
+//Interrupt handler for GPIO_PIR2
+static irqreturn_t gpio_irq2_handler(int irq,void *dev_id) 
+{
+  static unsigned long flags = 0;
+  
+#ifdef EN_DEBOUNCE
+   unsigned long diff = jiffies - old_jiffie;
+   if (diff < 20)
+   {
+     return IRQ_HANDLED;
+   }
+  
+  old_jiffie = jiffies;
+#endif  
+
+  local_irq_save(flags);
+  // led_toggle = (0x01 ^ led_toggle);                             // toggle the old value
+  // gpio_set_value(GPIO_21_OUT, led_toggle);                      // toggle the GPIO_21_OUT
+  pr_info("Interrupt Occurred : GPIO_PIR2 : %d ",gpio_get_value(GPIO_PIR2));
+  local_irq_restore(flags);
+  return IRQ_HANDLED;
+}
+ 
+dev_t dev = 0;
+static struct class *dev_class;
+static struct cdev etx_cdev;
+ 
+static int __init etx_driver_init(void);
+static void __exit etx_driver_exit(void);
+ 
+ 
+/*************** Driver functions **********************/
+static int etx_open(struct inode *inode, struct file *file);
+static int etx_release(struct inode *inode, struct file *file);
+static ssize_t etx_read(struct file *filp, 
+                char __user *buf, size_t len,loff_t * off);
+static ssize_t etx_write(struct file *filp, 
+                const char *buf, size_t len, loff_t * off);
+/******************************************************/
+
+//File operation structure 
+static struct file_operations fops =
+{
+  .owner          = THIS_MODULE,
+  .read           = etx_read,
+  .write          = etx_write,
+  .open           = etx_open,
+  .release        = etx_release,
 };
 
 static int gpio_num = GPIO_PIR1;
 static int gpio_num2 = GPIO_PIR2;
 
-static int __init pir_parking_pir(void)
+/*
+** This function will be called when we open the Device file
+*/ 
+static int etx_open(struct inode *inode, struct file *file)
 {
-	int ret;
-	
-		ret = alloc_chrdev_region(&devt, 0, NUM_PIR_Sensors, MODULE_NAME);    /* allocate memory*/
-	if (ret) {
-		pr_err("%s: Failed to allocate char device region.\n",
-			MODULE_NAME);
-		goto out;
-	}
-
-	cdev_init(&pir_cdev, &fops);               /* linking fops to cdev structure*/
-	pir_cdev.owner = THIS_MODULE;
-	ret = cdev_add(&pir_cdev, devt, NUM_PIR_Sensors);
-	if (ret) {
-		pr_err("%s: Failed to add cdev.\n", MODULE_NAME);
-		goto cdev_err;
-	}
-
-	pir_class = class_create(THIS_MODULE, "pir-test");    /* class creation*/
-	if (IS_ERR(pir_class)) {
-		pr_err("%s: class_create() failed.\n", MODULE_NAME);
-		ret = PTR_ERR(pir_class);
-		goto class_err;
-	}
-
-	pir_device = device_create(pir_class, NULL, devt, NULL, MODULE_NAME);      /*device creation*/
-	if (IS_ERR(pir_device)) {
-		pr_err("%s: device_create() failed.\n", MODULE_NAME);
-		ret = PTR_ERR(pir_device);
-		goto dev_err;
-	}
-
-	iomap = ioremap(GPIO_BASE, GPIO_REGION_SIZE);           /* maps bus memory to CPU space*/ 
-	if (!iomap) {
-		pr_err("%s: ioremap() failed.\n", MODULE_NAME);
-		ret = -EINVAL;
-		goto remap_err;
-	}
-
-	func_select_reg_offset = 4 * (gpio_num / 10);   /* selecting the func sel reg for a GPIO pin*/
-	func_select_bit_offset = (gpio_num % 10) * 3;   /* selecting the offset of the starting function bit*/
-	
-	func_select_reg_offset2 = 4 * (gpio_num2 / 10); 
-	func_select_bit_offset2 = (gpio_num2 % 10) * 3;
-
-
-	save_gpio_func_select();     
-	save_gpio_func_select2();
-	
-	pin_direction_input();  
-	pin_direction_input2();
-
-	pr_info("%s: Module loaded\n", MODULE_NAME);
-	goto out;
-
-remap_err:
-	device_destroy(pir_class, devt);
-dev_err:
-	class_unregister(pir_class);
-	class_destroy(pir_class);
-class_err:
-	cdev_del(&pir_cdev);
-cdev_err:
-	unregister_chrdev_region(devt, NUM_PIR_Sensors);
-out:
-	return ret;
+  pr_info("Device File Opened...!!!\n");
+  return 0;
 }
 
-static void __exit exit_parking_pir(void)
+/*
+** This function will be called when we close the Device file
+*/ 
+static int etx_release(struct inode *inode, struct file *file)
 {
-	restore_gpio_func_select();
-	restore_gpio_func_select2();
-	iounmap(iomap);
-	device_destroy(pir_class, devt);
-	class_unregister(pir_class);
-	class_destroy(pir_class);
-	cdev_del(&pir_cdev);
-	unregister_chrdev_region(devt, NUM_PIR_Sensors);
-	pr_info("%s: Module unloaded\n", MODULE_NAME);
+  pr_info("Device File Closed...!!!\n");
+  return 0;
 }
 
-static int pir_parking_open(struct inode *inodep, struct file *filep)
+/*
+** This function will be called when we read the Device file
+*/ 
+static ssize_t etx_read(struct file *filp, 
+                char __user *buf, size_t len, loff_t *off)
 {
-	return 0;
-}
+	/* New Code  */
+	uint8_t gpio_state_1 = 0;
+  	uint8_t gpio_state_2 = 0;
 
-static int pir_parking_release(struct inode *inodep, struct file *filep)
-{
-	return 0;
-}
+	//reading GPIO value
+	gpio_state = gpio_get_value(GPIO_PIR1);
+	gpio_state = gpio_get_value(GPIO_PIR2);
 
-static ssize_t
-pir_parking_read(struct file *filep, char __user *buf, size_t len, loff_t *off)
-{
-	int err;
-	/* Read PIR Sensor outputs*/
+	//write to user
+	len = 1;
+	if( copy_to_user(buf, &gpio_state_1, len) > 0) {
+		pr_err("ERROR: Not all the bytes of gpio_state_1 have been copied to user\n");
+	}
 
-	read_pin(); 
-	read_pin2();
+	if( copy_to_user(buf, &gpio_state_2, len) > 0) {
+		pr_err("ERROR: Not all the bytes of of gpio_state_2 have been copied to user\n");
+	}
 	
-	if ((int)pin_value[0]==49)    /* PIR 1 Triggered: Send 1 */
-	{ val[0] = 1;
-			printk("Car movement at PIR 1");
-			printk("pin_value[0] = %s\n",pin_value);
-		err = copy_to_user(buf, val, 1);
-		printk("%d",err);
-	if (err)
-		return -EFAULT;
-	}
-	else if ((int)pin_value2[0]==49)      /* PIR 2 Triggered: Send 2 */
-	{ val[0] = 2;
-	printk("Car movement at PIR 2");
-	printk("pin_value2[0] = %s\n",pin_value2);
-		err = copy_to_user(buf, val, 1);
-	if (err)
-		return -EFAULT;
-	}
-	else {
-		val[0]=0;
-		printk("No car movement"); 			 /* No car movement: Send 0 */
-		err = copy_to_user(buf,val,1);
-		if (err)
-		return -EFAULT;
-		}
+	pr_info("Read function : GPIO_PIR1 = %d \n", gpio_state_1);
+	pr_info("Read function : GPIO_PIR2 = %d \n", gpio_state_2);
 
 	return 0;
 }
 
-static ssize_t
-pir_parking_write(struct file *filep, const char __user *buf, size_t len, loff_t *off)
-{ 
-	return 0;
-}
-
-
-
-static void save_gpio_func_select(void)                 /* Initial function triplet saved*/
+/*
+** This function will be called when we write the Device file
+*/
+static ssize_t etx_write(struct file *filp, 
+                const char __user *buf, size_t len, loff_t *off)
 {
-	int val;
-
-	val = ioread32(iomap + func_select_reg_offset);
-	func_select_initial_val = (val >> func_select_bit_offset) & 7;
+  uint8_t rec_buf[10] = {0};
+  
+  if( copy_from_user( rec_buf, buf, len ) > 0) {
+    pr_err("ERROR: Not all the bytes have been copied from user\n");
+  }
+  
+  pr_info("Write Function : GPIO_21 Set = %c\n", rec_buf[0]);
+  
+  if (rec_buf[0]=='1') {
+    //set the GPIO value to HIGH
+    gpio_set_value(GPIO_21_OUT, 1);
+  } else if (rec_buf[0]=='0') {
+    //set the GPIO value to LOW
+    gpio_set_value(GPIO_21_OUT, 0);
+  } else {
+    pr_err("Unknown command : Please provide either 1 or 0 \n");
+  }
+  
+  return len;
 }
 
-static void save_gpio_func_select2(void)
+/*
+** Module Init function
+*/ 
+static int __init etx_driver_init(void)
 {
-	int val;
+  /*Allocating Major number*/
+  if((alloc_chrdev_region(&dev, 0, 1, "etx_Dev")) <0){
+    pr_err("Cannot allocate major number\n");
+    goto r_unreg;
+  }
+  pr_info("Major = %d Minor = %d \n",MAJOR(dev), MINOR(dev));
 
-	val = ioread32(iomap + func_select_reg_offset2);
-	func_select_initial_val2 = (val >> func_select_bit_offset2) & 7;
+  /*Creating cdev structure*/
+  cdev_init(&etx_cdev,&fops);
+
+  /*Adding character device to the system*/
+  if((cdev_add(&etx_cdev,dev,1)) < 0){
+    pr_err("Cannot add the device to the system\n");
+    goto r_del;
+  }
+
+  /*Creating struct class*/
+  if((dev_class = class_create(THIS_MODULE,"etx_class")) == NULL){
+    pr_err("Cannot create the struct class\n");
+    goto r_class;
+  }
+
+  /*Creating device*/
+  if((device_create(dev_class,NULL,dev,NULL,"etx_device")) == NULL){
+    pr_err( "Cannot create the Device \n");
+    goto r_device;
+  }
+  
+  //Output GPIO configuration
+  //Checking the GPIO is valid or not
+  if(gpio_is_valid(GPIO_21_OUT) == false){
+    pr_err("GPIO %d is not valid\n", GPIO_21_OUT);
+    goto r_device;
+  }
+  
+  //Requesting the GPIO
+  if(gpio_request(GPIO_21_OUT,"GPIO_21_OUT") < 0){
+    pr_err("ERROR: GPIO %d request\n", GPIO_21_OUT);
+    goto r_gpio_out;
+  }
+  
+  //configure the GPIO as output
+  gpio_direction_output(GPIO_21_OUT, 0);
+  
+ //Input GPIO configuratioin
+  //Checking the GPIO is valid or not
+  if(gpio_is_valid(GPIO_PIR1) == false){
+    pr_err("GPIO %d is not valid\n", GPIO_PIR1);
+    goto r_gpio_in;
+  }
+    if(gpio_is_valid(GPIO_PIR2) == false){
+    pr_err("GPIO %d is not valid\n", GPIO_PIR2);
+    goto r_gpio_in;
+  }
+  
+  //Requesting the GPIO
+  if(gpio_request(GPIO_PIR1,"GPIO_PIR1") < 0){
+    pr_err("ERROR: GPIO %d request\n", GPIO_PIR1);
+    goto r_gpio_in;
+  }
+    if(gpio_request(GPIO_PIR2,"GPIO_PIR2") < 0){
+    pr_err("ERROR: GPIO %d request\n", GPIO_PIR2);
+    goto r_gpio_in;
+  }
+  
+  //configure the GPIO as input
+  gpio_direction_input(GPIO_PIR1);
+  gpio_direction_input(GPIO_PIR2);
+  
+  /*
+  ** I have commented the below few lines, as gpio_set_debounce is not supported 
+  ** in the Raspberry pi. So we are using EN_DEBOUNCE to handle this in this driver.
+  */ 
+#ifndef EN_DEBOUNCE
+  //Debounce the button with a delay of 200ms
+  if(gpio_set_debounce(GPIO_PIR1, 200) < 0){
+    pr_err("ERROR: gpio_set_debounce - %d\n", GPIO_PIR1);
+    //goto r_gpio_in;
+  }
+  if(gpio_set_debounce(GPIO_PIR2, 200) < 0){
+    pr_err("ERROR: gpio_set_debounce - %d\n", GPIO_PIR2);
+    //goto r_gpio_in;
+  }  
+#endif
+  
+  //Get the IRQ number for our GPIO
+  GPIO_irq1 = gpio_to_irq(GPIO_PIR1);
+  pr_info("GPIO_irqNumber = %d\n", GPIO_irqNumber);
+
+  GPIO_irq2 = gpio_to_irq(GPIO_PIR2);
+  pr_info("GPIO_irqNumber = %d\n", GPIO_irqNumber);
+
+  if (request_irq(GPIO_irq1,             //IRQ number
+                  (void *)gpio_irq1_handler,   //IRQ handler
+                  IRQF_TRIGGER_RISING,        //Handler will be called in raising edge
+                  "pir_device",               //used to identify the device name using this IRQ
+                  NULL)) {                    //device id for shared IRQ
+    pr_err("pir_device: cannot register IRQ ");
+    goto r_gpio_in;
+
+  if (request_irq(GPIO_irq2,             //IRQ number
+                  (void *)gpio_irq2_handler,   //IRQ handler
+                  IRQF_TRIGGER_RISING,        //Handler will be called in raising edge
+                  "pir_device",               //used to identify the device name using this IRQ
+                  NULL)) {                    //device id for shared IRQ
+    pr_err("pir_device: cannot register IRQ ");
+    goto r_gpio_in;
+ 
+  pr_info("Device Driver Insert...Done!!!\n");
+  return 0;
+
+r_gpio_in:
+  	gpio_free(GPIO_PIR1);
+	gpio_free(GPIO_PIR2);
+r_gpio_out:
+  gpio_free(GPIO_21_OUT);
+r_device:
+  device_destroy(dev_class,dev);
+r_class:
+  class_destroy(dev_class);
+r_del:
+  cdev_del(&etx_cdev);
+r_unreg:
+  unregister_chrdev_region(dev,1);
+  
+  return -1;
 }
 
-static void restore_gpio_func_select(void)          /* Initial function triplet restored*/
+/*
+** Module exit function
+*/
+static void __exit etx_driver_exit(void)
 {
-	int val;
-
-	val = ioread32(iomap + func_select_reg_offset);
-	val &= ~(7 << func_select_bit_offset);
-	val |= func_select_initial_val << func_select_bit_offset;
-	iowrite32(val, iomap + func_select_reg_offset);
+  free_irq(GPIO_irq1,NULL);
+  free_irq(GPIO_irq2,NULL);
+  gpio_free(GPIO_PIR1);
+  gpio_free(GPIO_PIR2);
+  gpio_free(GPIO_21_OUT);
+  device_destroy(dev_class,dev);
+  class_destroy(dev_class);
+  cdev_del(&etx_cdev);
+  unregister_chrdev_region(dev, 1);
+  pr_info("Device Driver Remove...Done!!\n");
 }
-
-static void restore_gpio_func_select2(void)
-{
-	int val;
-
-	val = ioread32(iomap + func_select_reg_offset2);
-	val &= ~(7 << func_select_bit_offset2);
-	val |= func_select_initial_val2 << func_select_bit_offset2;
-	iowrite32(val, iomap + func_select_reg_offset2);
-}
-
-static void pin_direction_input(void)			/*Setting the GPIO to input (FUNCTION BITS = 000) */
-{
-	int val;
-
-	val = ioread32(iomap + func_select_reg_offset);
-	val &= ~(6 << func_select_bit_offset);
-	val |= 0 << func_select_bit_offset;
-	iowrite32(val, iomap + func_select_reg_offset);
-}
-
-static void pin_direction_input2(void)
-{
-	int val;
-
-	val = ioread32(iomap + func_select_reg_offset2);
-	val &= ~(6 << func_select_bit_offset2);
-	val |= 0 << func_select_bit_offset2;
-	iowrite32(val, iomap + func_select_reg_offset2);
-}
-
-
-static void read_pin(void)				 /* GPLEV - read only register used to check value of GPIOs */ 
-{
-	int val;
-
-	val = ioread32(iomap + GPLEV_OFFSET);  
-	val = (val >> gpio_num) & 1;
-	pin_value[0] = val ? '1' : '0';
-}
-
-static void read_pin2(void)
-{
-	int val;
-
-	val = ioread32(iomap + GPLEV_OFFSET);
-	val = (val >> gpio_num2) & 1;
-	pin_value2[0] = val ? '1' : '0';
-}
-
-module_init(pir_parking_pir);
-module_exit(exit_parking_pir);
-
+ 
+module_init(etx_driver_init);
+module_exit(etx_driver_exit);
+ 
 MODULE_DESCRIPTION("Smart Parking Lot System Driver for Raspberry Pi 3B");
 MODULE_AUTHOR("Naren (2015HD400547P) and Nishad (2016HS400215P)");
 MODULE_LICENSE("GPL");
