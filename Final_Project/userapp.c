@@ -23,12 +23,16 @@
          ; 
  }
 
+clock_t entry_time[1000];
+clock_t exit_time[1000];
+
 int main()
 {	
     int i=0;
 	int fd;
 	char val[2];
 	int available_spaces;
+	int car_number = 0;
 	
 	fd = open(FILE_NAME, O_RDWR | O_SYNC);
 	if (fd < 0) {
@@ -52,7 +56,9 @@ int main()
 			{
 				printf("\nPIR_SENSOR_1: Car Entry Detected");
 				available_spaces--;
+				car_number++;
 				delay(4000); /*The sensor needs 4 seconds to go from HIGH to LOW*/
+				
 			}
 		
 		printf("\nAvailable Empty Spaces: %d",available_spaces);
