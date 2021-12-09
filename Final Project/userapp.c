@@ -27,35 +27,18 @@ int main()
 {	
     int i=0;
 	int fd;
-	char val[2];
-	int available_spaces;
+	unsigned long int empty_spaces;
 	
 	fd = open(FILE_NAME, O_RDWR | O_SYNC);
 	if (fd < 0) {
 		perror("Failed to open pir_parking device");
 		exit(errno);
 	}
-	printf("\nEnter the number of available parking spaces");
-	scanf("%d",&available_spaces);
 
     while(i<3000){
 		delay(1000); // Keep a delay of 1 second
-		read(fd, val, 1);
-		
-		if (val[0] == 2)
-			{
-				printf("\nPIR_SENSOR_2: Car Exit Detected");
-				available_spaces++;
-				delay(4000); /*The sensor needs 4 seconds to go from HIGH to LOW*/
-			}
-		else if(val[0] == 1)
-			{
-				printf("\nPIR_SENSOR_1: Car Entry Detected");
-				available_spaces--;
-				delay(4000); /*The sensor needs 4 seconds to go from HIGH to LOW*/
-			}
-		
-		printf("\nAvailable Empty Spaces: %d",available_spaces);
+		read(fd, &empty_spaces, 4);
+		printf("\nAvailable Empty Spaces: %d",empty_spaces);
 		i++;
 	}
 	close(fd);
