@@ -12,3 +12,5 @@ Summary: This project implements a character device driver for a smart parking l
 6. The number of available parking spaces will be continuously updated on the display.
 7. Trigger the entry and exit pir sensors to observe the corresponding decrement/increment change in the number of parking spaces available. 
 8. Press ctrl+c to stop the userapp
+
+Please find the project demonstration video at: https://drive.google.com/drive/folders/11GjeqSehsOblgvvSe-F4OVWsOUHtOC0g?usp=sharing
